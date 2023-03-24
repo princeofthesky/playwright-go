@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	conf     = flag.String("conf", "./tiktok_audio.toml", "config run file *.toml")
+	conf     = flag.String("conf", "./tiktok_audio_decoder.toml", "config run file *.toml")
 	c        = config.CrawlConfig{}
 	audioDir = flag.String("audio_dir", "/tiktok_audios/", "video meme direction")
 	coverDir = flag.String("cover_dir", "/tiktok_cover_audios/", "cover meme direction")
