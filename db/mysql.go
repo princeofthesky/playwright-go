@@ -78,9 +78,9 @@ func GetAllRegions() ([]Region, error) {
 	return data, err
 }
 
-func GetRegionByTitle(title string) (Region, error) {
-	info := Region{Title: title}
-	err := mysqlDb.Model(&info).Where("title=?", info.Title).Select()
+func GetRegionByCode(code string) (Region, error) {
+	info := Region{Code: code}
+	err := mysqlDb.Model(&info).Where("code=?", info.Code).Select()
 	return info, err
 }
 

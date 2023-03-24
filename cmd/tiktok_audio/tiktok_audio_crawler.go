@@ -24,7 +24,7 @@ import (
 
 var (
 	conf           = flag.String("conf", "./tiktok_audio.toml", "config run file *.toml")
-	updateRegions  = flag.Int("update_region", 1, " 1 if update ,0 if not - defaults")
+	updateRegions  = flag.Int("update_region", 0, " 1 if update ,0 if not - defaults")
 	c              = config.CrawlConfig{}
 	audioDir       = flag.String("audio_dir", "/tiktok_audios/", "video meme direction")
 	coverDir       = flag.String("cover_dir", "/tiktok_cover_audios/", "cover meme direction")
@@ -141,6 +141,8 @@ func GetAudioDataFromTiktok(audioRequest model.TiktokPostAudioRequest) (model.Ti
 	if dataResponse.Code != 0 {
 		return dataResponse, errors.New("Error when get audio info from tik tok " + dataResponse.Msg)
 	}
+	//fmt.Println("request " ,string(body))
+	//fmt.Println("data  count " ,dataResponse.Data.Pagination.TotalCount)
 	return dataResponse, err
 }
 
@@ -164,10 +166,11 @@ func ParseAudioInfo(threadId int, dataCrawl *DataCrawl) error {
 		return err
 	}
 	totalPage := data.Data.Pagination.TotalCount / 20
+	fmt.Println(data.Data.Pagination.TotalCount,totalPage,maxPage)
 	if totalPage > maxPage {
 		totalPage = maxPage
 	}
-	region, _ := db.GetRegionByTitle(dataCrawl.Region)
+	region, _ := db.GetRegionByCode(dataCrawl.Region)
 	theme, _ := db.GetThemeByTitle(dataCrawl.Theme)
 	mood, _ := db.GetMoodByTitle(dataCrawl.Mood)
 	genre, _ := db.GetGenreByTitle(dataCrawl.Genre)
@@ -269,15 +272,15 @@ func UpdateRegions() {
 			fmt.Println("error when get data from region ", title, code ,err)
 			continue
 		}
-		if len(data.Data.List)==0 {
-			fmt.Println("error: Not found data from region ", title, code , " data = 0")
+		if len(data.Data.List)==0 || data.Data.Pagination.TotalCount<10000 {
+			fmt.Println("error: Not found data from region ", title, code , " data = 0",data.Data.Pagination.TotalCount)
 			continue
 		}
-		//fmt.Println("data from region ", title, code , " count " ,data.Data.Pagination.TotalCount)
-		//_, err = db.InsertRegionInfo(db.Region{Title: title, Code: code})
-		//if err != nil {
-		//	fmt.Println("UpdateRegions InsertRegionInfo err", err, title, code)
-		//}
+		fmt.Println("data from region ", title, code , " count " ,data.Data.Pagination.TotalCount)
+		_, err = db.InsertRegionInfo(db.Region{Title: title, Code: code})
+		if err != nil {
+			fmt.Println("UpdateRegions InsertRegionInfo err", err, title, code)
+		}
 	}
 }
 
