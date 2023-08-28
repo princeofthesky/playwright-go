@@ -1,0 +1,14 @@
+StartDate	=25
+EndDate 	=1
+
+[Postgres]
+	addr		= "127.0.0.1:5432"
+	user 		= "manga"
+	password	= "QMU4gPoEKHQW"
+	database	= "pose_dance"
+
+[Redis]
+    addr		= "127.0.0.1:6379"
+   	password	= ""
+   	db 		    = 2
+

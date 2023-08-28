@@ -4,19 +4,19 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"github.com/playwright-community/playwright-go/model"
-	"github.com/playwright-community/playwright-go/tiktok_audio_decoder"
-	"io"
-	"net/http"
-
 	"flag"
 	"fmt"
 	"github.com/pelletier/go-toml"
 	"github.com/playwright-community/playwright-go"
 	"github.com/playwright-community/playwright-go/config"
 	"github.com/playwright-community/playwright-go/db"
+	"github.com/playwright-community/playwright-go/model"
+	"github.com/playwright-community/playwright-go/tiktok_audio_decoder"
+	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -31,10 +31,12 @@ var (
 	userAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
 	count          = 0
 	maxPage        = 2
+	maxRetry       = 3
 	allDataCrawl   = []*DataCrawl{}
 	mu             sync.Mutex
 	errClickOption error = errors.New("Error when click option mood , theme , genre")
-	client               = http.DefaultClient
+	nginxProxy     []string
+	clients        []*http.Client
 )
 
 type DataCrawl struct {
@@ -71,8 +73,28 @@ func main() {
 	if c.MaxPage > 0 {
 		maxPage = c.MaxPage
 	}
+	if c.MaxRetry > 0 {
+		maxRetry = c.MaxRetry
+	}
 	err = db.Init(c.Postgres)
-
+	for _, proxy := range strings.Split(c.NginxProxy, ",") {
+		proxy = strings.TrimSpace(proxy)
+		if len(proxy) > 0 {
+			nginxProxy = append(nginxProxy, proxy)
+		}
+	}
+	thread := c.MaxThread
+	if thread < 2 {
+		thread = 2
+	}
+	if thread > 19 {
+		thread = 20
+	}
+	clients = make([]*http.Client, thread)
+	for i := 0; i < thread; i++ {
+		clients[i] = &http.Client{Timeout: 10 * time.Second}
+		defer clients[i].CloseIdleConnections()
+	}
 	if *updateRegions == 1 {
 		UpdateRegions()
 		//UpdateThemes(page)
@@ -85,21 +107,17 @@ func main() {
 		themes, _ := db.GetAllThemes()
 
 		for _, region := range regions {
-			for _, genre := range genres {
-				for _, mood := range moods {
-					for _, theme := range themes {
-						allDataCrawl = append(allDataCrawl, &DataCrawl{Region: region.Code, Genre: genre.Title, Theme: theme.Title, Mood: mood.Title})
+			if region.Id >= c.StartRegion {
+				for _, genre := range genres {
+					for _, mood := range moods {
+						for _, theme := range themes {
+							allDataCrawl = append(allDataCrawl, &DataCrawl{Region: region.Code, Genre: genre.Title, Theme: theme.Title, Mood: mood.Title})
+						}
 					}
 				}
 			}
 		}
-		thread := c.MaxThread
-		if thread < 2 {
-			thread = 2
-		}
-		if thread > 19 {
-			thread = 20
-		}
+
 		var wg sync.WaitGroup
 
 		wg.Add(thread)
@@ -119,14 +137,24 @@ func main() {
 		wg.Wait()
 	}
 }
-func GetAudioDataFromTiktok(audioRequest model.TiktokPostAudioRequest) (model.TiktokRequestResponse, error) {
+func GetAudioDataFromTiktok(threadId int, audioRequest model.TiktokPostAudioRequest) (model.TiktokRequestResponse, error) {
+	var dataResponse model.TiktokRequestResponse
+
 	body, _ := json.Marshal(audioRequest)
-	req, _ := http.NewRequest("POST", "https://ads.tiktok.com/creative_radar_api/v1/audio_lib/music/list", bytes.NewReader([]byte(body)))
+	url := "https://ads.tiktok.com/creative_radar_api/v1/audio_lib/music/list"
+	i := rand.Intn(len(nginxProxy) + 1)
+	if i > 0 {
+		url = nginxProxy[i-1] + url
+	}
+	req, _ := http.NewRequest("POST", url, bytes.NewReader([]byte(body)))
 	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36")
 	req.Header.Set("content-type", "application/json")
-	res, err := client.Do(req)
-	time.Sleep(100 * time.Millisecond)
-	var dataResponse model.TiktokRequestResponse
+	start := time.Now()
+	res, err := clients[i].Do(req)
+	start = start.Add(100 * time.Millisecond)
+	end := time.Now()
+	time.Sleep(start.Sub(end))
+
 	if err != nil {
 		return dataResponse, err
 	}
@@ -146,8 +174,20 @@ func GetAudioDataFromTiktok(audioRequest model.TiktokPostAudioRequest) (model.Ti
 	return dataResponse, err
 }
 
+func GetAudioDataFromTiktokWithRetry(threadId int, audioRequest model.TiktokPostAudioRequest) (model.TiktokRequestResponse, error) {
+	dataResponse, err := GetAudioDataFromTiktok(threadId, audioRequest)
+	i := 1
+	for err != nil && i < maxRetry {
+		time.Sleep(10 * time.Second)
+		dataResponse, err = GetAudioDataFromTiktok(threadId, audioRequest)
+		i++
+	}
+	return dataResponse, err
+}
+
 func ParseAudioInfo(threadId int, dataCrawl *DataCrawl) error {
 	audioRequest := model.TiktokPostAudioRequest{
+		Duration:   model.TiktokAudioDuration{RangeLower: 6, RangeUpper: 300},
 		Page:       1,
 		Limit:      20,
 		Region:     dataCrawl.Region,
@@ -160,13 +200,13 @@ func ParseAudioInfo(threadId int, dataCrawl *DataCrawl) error {
 		Placements: []string{},
 	}
 	fmt.Println(threadId, dataCrawl.Region, dataCrawl.Theme, dataCrawl.Mood, dataCrawl.Genre)
-	data, err := GetAudioDataFromTiktok(audioRequest)
+	firstPage, err := GetAudioDataFromTiktokWithRetry(threadId, audioRequest)
 	if err != nil {
-		fmt.Println("error when GetAudioDataFromTiktok ", err, data.Msg)
+		fmt.Println("error when GetAudioDataFromTiktok ", err, firstPage.Msg)
 		return err
 	}
-	totalPage := data.Data.Pagination.TotalCount / 20
-	fmt.Println(data.Data.Pagination.TotalCount,totalPage,maxPage)
+	totalPage := (firstPage.Data.Pagination.TotalCount + 19) / 20
+	fmt.Println(firstPage.Data.Pagination.TotalCount, totalPage, maxPage)
 	if totalPage > maxPage {
 		totalPage = maxPage
 	}
@@ -176,13 +216,17 @@ func ParseAudioInfo(threadId int, dataCrawl *DataCrawl) error {
 	genre, _ := db.GetGenreByTitle(dataCrawl.Genre)
 	for i := totalPage; i > 0; i-- {
 		audioRequest.Page = i
-		data, err = GetAudioDataFromTiktok(audioRequest)
-		if err != nil {
-			fmt.Println("error when GetAudioDataFromTiktok ", err, data.Msg)
-			continue
+		dataPage := firstPage
+		if i != 1 {
+			dataPage, err = GetAudioDataFromTiktokWithRetry(threadId, audioRequest)
+			if err != nil {
+				fmt.Println("error when GetAudioDataFromTiktok ", err, dataPage.Msg)
+				dataPage = firstPage
+				i = 1
+			}
 		}
-		for j := len(data.Data.List) - 1; j >= 0; j-- {
-			tiktokAudioResponse := data.Data.List[j]
+		for j := len(dataPage.Data.List) - 1; j >= 0; j-- {
+			tiktokAudioResponse := dataPage.Data.List[j]
 			tiktokAudioId := tiktokAudioResponse.MusicId
 			audioInfo, _ := db.GetAudioByTikTokId(tiktokAudioId)
 			if audioInfo.Id == 0 {
@@ -197,9 +241,12 @@ func ParseAudioInfo(threadId int, dataCrawl *DataCrawl) error {
 				audioInfo.TiktokId = tiktokAudioId
 				audioInfo.Url = audioInfo.TiktokUrl
 				audioInfo.CrawledTime = time.Now().Unix()
+				if !strings.HasPrefix(audioInfo.TiktokUrl, "https://") && !strings.HasPrefix(audioInfo.TiktokUrl, "http://") {
+					continue
+				}
 				audioInfo, err = db.InsertAudioInfo(audioInfo)
 				if err != nil {
-					println("error when insert audio ", err.Error())
+					//println("error when insert audio ", err.Error())
 					continue
 				}
 			}
@@ -213,7 +260,7 @@ func ParseAudioInfo(threadId int, dataCrawl *DataCrawl) error {
 					MoodId:      mood.Id,
 				})
 				if err != nil {
-					println("error when insert to list region audio ", err.Error())
+					//println("error when insert to list region audio ", err.Error())
 				}
 			}
 
@@ -226,7 +273,7 @@ func UpdateRegions() {
 
 	regionsList := "[{\"value\":\"AD\",\"label\":\"Andorra\"},{\"value\":\"AE\",\"label\":\"United Arab Emirates\"},{\"value\":\"AF\",\"label\":\"Afghanistan\"},{\"value\":\"AG\",\"label\":\"Antigua and Barbuda\"},{\"value\":\"AI\",\"label\":\"Anguilla\"},{\"value\":\"AL\",\"label\":\"Albania\"},{\"value\":\"AM\",\"label\":\"Armenia\"},{\"value\":\"AO\",\"label\":\"Angola\"},{\"value\":\"AR\",\"label\":\"Argentina\"},{\"value\":\"AS\",\"label\":\"American Samoa\"},{\"value\":\"AT\",\"label\":\"Austria\"},{\"value\":\"AU\",\"label\":\"Australia\"},{\"value\":\"AW\",\"label\":\"Aruba\"},{\"value\":\"AX\",\"label\":\"Åland\"},{\"value\":\"AZ\",\"label\":\"Azerbaijan\"},{\"value\":\"BA\",\"label\":\"Bosnia and Herzegovina\"},{\"value\":\"BB\",\"label\":\"Barbados\"},{\"value\":\"BD\",\"label\":\"Bangladesh\"},{\"value\":\"BE\",\"label\":\"Belgium\"},{\"value\":\"BF\",\"label\":\"Burkina Faso\"},{\"value\":\"BG\",\"label\":\"Bulgaria\"},{\"value\":\"BH\",\"label\":\"Bahrain\"},{\"value\":\"BI\",\"label\":\"Burundi\"},{\"value\":\"BJ\",\"label\":\"Benin\"},{\"value\":\"BL\",\"label\":\"Saint-Barthélemy\"},{\"value\":\"BM\",\"label\":\"Bermuda\"},{\"value\":\"BN\",\"label\":\"Brunei\"},{\"value\":\"BO\",\"label\":\"Bolivia\"},{\"value\":\"BQ\",\"label\":\"Bonaire, Sint Eustatius, and Saba\"},{\"value\":\"BR\",\"label\":\"Brazil\"},{\"value\":\"BS\",\"label\":\"Bahamas\"},{\"value\":\"BT\",\"label\":\"Bhutan\"},{\"value\":\"BV\",\"label\":\"Bouvet Island\"},{\"value\":\"BW\",\"label\":\"Botswana\"},{\"value\":\"BY\",\"label\":\"Belarus\"},{\"value\":\"BZ\",\"label\":\"Belize\"},{\"value\":\"CA\",\"label\":\"Canada\"},{\"value\":\"CC\",\"label\":\"Cocos [Keeling] Islands\"},{\"value\":\"CD\",\"label\":\"Congo\"},{\"value\":\"CF\",\"label\":\"Central African Republic\"},{\"value\":\"CG\",\"label\":\"Republic of the Congo\"},{\"value\":\"CH\",\"label\":\"Switzerland\"},{\"value\":\"CI\",\"label\":\"Ivory Coast\"},{\"value\":\"CK\",\"label\":\"Cook Islands\"},{\"value\":\"CL\",\"label\":\"Chile\"},{\"value\":\"CM\",\"label\":\"Cameroon\"},{\"value\":\"CN\",\"label\":\"China\"},{\"value\":\"CO\",\"label\":\"Colombia\"},{\"value\":\"CR\",\"label\":\"Costa Rica\"},{\"value\":\"CU\",\"label\":\"Cuba\"},{\"value\":\"CV\",\"label\":\"Cabo Verde\"},{\"value\":\"CW\",\"label\":\"Curaçao\"},{\"value\":\"CX\",\"label\":\"Christmas Island\"},{\"value\":\"CY\",\"label\":\"Cyprus\"},{\"value\":\"CZ\",\"label\":\"Czechia\"},{\"value\":\"DE\",\"label\":\"Germany\"},{\"value\":\"DJ\",\"label\":\"Djibouti\"},{\"value\":\"DK\",\"label\":\"Denmark\"},{\"value\":\"DM\",\"label\":\"Dominica\"},{\"value\":\"DO\",\"label\":\"Dominican Republic\"},{\"value\":\"DZ\",\"label\":\"Algeria\"},{\"value\":\"EC\",\"label\":\"Ecuador\"},{\"value\":\"EE\",\"label\":\"Estonia\"},{\"value\":\"EG\",\"label\":\"Egypt\"},{\"value\":\"EH\",\"label\":\"Western Sahara\"},{\"value\":\"ER\",\"label\":\"Eritrea\"},{\"value\":\"ES\",\"label\":\"Spain\"},{\"value\":\"ET\",\"label\":\"Ethiopia\"},{\"value\":\"FI\",\"label\":\"Finland\"},{\"value\":\"FJ\",\"label\":\"Fiji\"},{\"value\":\"FK\",\"label\":\"Falkland Islands\"},{\"value\":\"FM\",\"label\":\"Federated States of Micronesia\"},{\"value\":\"FO\",\"label\":\"Faroe Islands\"},{\"value\":\"FR\",\"label\":\"France\"},{\"value\":\"GA\",\"label\":\"Gabon\"},{\"value\":\"GB\",\"label\":\"United Kingdom\"},{\"value\":\"GD\",\"label\":\"Grenada\"},{\"value\":\"GE\",\"label\":\"Georgia\"},{\"value\":\"GF\",\"label\":\"French Guiana\"},{\"value\":\"GG\",\"label\":\"Guernsey\"},{\"value\":\"GH\",\"label\":\"Ghana\"},{\"value\":\"GI\",\"label\":\"Gibraltar\"},{\"value\":\"GL\",\"label\":\"Greenland\"},{\"value\":\"GM\",\"label\":\"Gambia\"},{\"value\":\"GN\",\"label\":\"Guinea\"},{\"value\":\"GP\",\"label\":\"Guadeloupe\"},{\"value\":\"GQ\",\"label\":\"Equatorial Guinea\"},{\"value\":\"GR\",\"label\":\"Greece\"},{\"value\":\"GS\",\"label\":\"South Georgia and the South Sandwich Islands\"},{\"value\":\"GT\",\"label\":\"Guatemala\"},{\"value\":\"GU\",\"label\":\"Guam\"},{\"value\":\"GW\",\"label\":\"Guinea-Bissau\"},{\"value\":\"GY\",\"label\":\"Guyana\"},{\"value\":\"HK\",\"label\":\"Hong Kong\"},{\"value\":\"HM\",\"label\":\"Heard Island and McDonald Islands\"},{\"value\":\"HN\",\"label\":\"Honduras\"},{\"value\":\"HR\",\"label\":\"Croatia\"},{\"value\":\"HT\",\"label\":\"Haiti\"},{\"value\":\"HU\",\"label\":\"Hungary\"},{\"value\":\"ID\",\"label\":\"Indonesia\"},{\"value\":\"IE\",\"label\":\"Ireland\"},{\"value\":\"IL\",\"label\":\"Israel\"},{\"value\":\"IM\",\"label\":\"Isle of Man\"},{\"value\":\"IN\",\"label\":\"India\"},{\"value\":\"IO\",\"label\":\"British Indian Ocean Territory\"},{\"value\":\"IQ\",\"label\":\"Iraq\"},{\"value\":\"IR\",\"label\":\"Iran\"},{\"value\":\"IS\",\"label\":\"Iceland\"},{\"value\":\"IT\",\"label\":\"Italy\"},{\"value\":\"JE\",\"label\":\"Jersey\"},{\"value\":\"JM\",\"label\":\"Jamaica\"},{\"value\":\"JO\",\"label\":\"Hashemite Kingdom of Jordan\"},{\"value\":\"JP\",\"label\":\"Japan\"},{\"value\":\"KE\",\"label\":\"Kenya\"},{\"value\":\"KG\",\"label\":\"Kyrgyzstan\"},{\"value\":\"KH\",\"label\":\"Cambodia\"},{\"value\":\"KI\",\"label\":\"Kiribati\"},{\"value\":\"KM\",\"label\":\"Comoros\"},{\"value\":\"KN\",\"label\":\"St Kitts and Nevis\"},{\"value\":\"KP\",\"label\":\"North Korea\"},{\"value\":\"KR\",\"label\":\"Republic of Korea\"},{\"value\":\"KW\",\"label\":\"Kuwait\"},{\"value\":\"KY\",\"label\":\"Cayman Islands\"},{\"value\":\"KZ\",\"label\":\"Kazakhstan\"},{\"value\":\"LA\",\"label\":\"Laos\"},{\"value\":\"LB\",\"label\":\"Lebanon\"},{\"value\":\"LC\",\"label\":\"Saint Lucia\"},{\"value\":\"LI\",\"label\":\"Liechtenstein\"},{\"value\":\"LK\",\"label\":\"Sri Lanka\"},{\"value\":\"LR\",\"label\":\"Liberia\"},{\"value\":\"LS\",\"label\":\"Lesotho\"},{\"value\":\"LT\",\"label\":\"Republic of Lithuania\"},{\"value\":\"LU\",\"label\":\"Luxembourg\"},{\"value\":\"LV\",\"label\":\"Latvia\"},{\"value\":\"LY\",\"label\":\"Libya\"},{\"value\":\"MA\",\"label\":\"Morocco\"},{\"value\":\"MC\",\"label\":\"Monaco\"},{\"value\":\"MD\",\"label\":\"Republic of Moldova\"},{\"value\":\"ME\",\"label\":\"Montenegro\"},{\"value\":\"MF\",\"label\":\"Saint Martin\"},{\"value\":\"MG\",\"label\":\"Madagascar\"},{\"value\":\"MH\",\"label\":\"Marshall Islands\"},{\"value\":\"MK\",\"label\":\"Macedonia\"},{\"value\":\"ML\",\"label\":\"Mali\"},{\"value\":\"MM\",\"label\":\"Myanmar [Burma]\"},{\"value\":\"MN\",\"label\":\"Mongolia\"},{\"value\":\"MO\",\"label\":\"Macao\"},{\"value\":\"MP\",\"label\":\"Northern Mariana Islands\"},{\"value\":\"MQ\",\"label\":\"Martinique\"},{\"value\":\"MR\",\"label\":\"Mauritania\"},{\"value\":\"MS\",\"label\":\"Montserrat\"},{\"value\":\"MT\",\"label\":\"Malta\"},{\"value\":\"MU\",\"label\":\"Mauritius\"},{\"value\":\"MV\",\"label\":\"Maldives\"},{\"value\":\"MW\",\"label\":\"Malawi\"},{\"value\":\"MX\",\"label\":\"Mexico\"},{\"value\":\"MY\",\"label\":\"Malaysia\"},{\"value\":\"MZ\",\"label\":\"Mozambique\"},{\"value\":\"NA\",\"label\":\"Namibia\"},{\"value\":\"NC\",\"label\":\"New Caledonia\"},{\"value\":\"NE\",\"label\":\"Niger\"},{\"value\":\"NF\",\"label\":\"Norfolk Island\"},{\"value\":\"NG\",\"label\":\"Nigeria\"},{\"value\":\"NI\",\"label\":\"Nicaragua\"},{\"value\":\"NL\",\"label\":\"Netherlands\"},{\"value\":\"NO\",\"label\":\"Norway\"},{\"value\":\"NP\",\"label\":\"Nepal\"},{\"value\":\"NR\",\"label\":\"Nauru\"},{\"value\":\"NU\",\"label\":\"Niue\"},{\"value\":\"NZ\",\"label\":\"New Zealand\"},{\"value\":\"OM\",\"label\":\"Oman\"},{\"value\":\"PA\",\"label\":\"Panama\"},{\"value\":\"PE\",\"label\":\"Peru\"},{\"value\":\"PF\",\"label\":\"French Polynesia\"},{\"value\":\"PG\",\"label\":\"Papua New Guinea\"},{\"value\":\"PH\",\"label\":\"Philippines\"},{\"value\":\"PK\",\"label\":\"Pakistan\"},{\"value\":\"PL\",\"label\":\"Poland\"},{\"value\":\"PM\",\"label\":\"Saint Pierre and Miquelon\"},{\"value\":\"PN\",\"label\":\"Pitcairn Islands\"},{\"value\":\"PR\",\"label\":\"Puerto Rico\"},{\"value\":\"PS\",\"label\":\"Palestine\"},{\"value\":\"PT\",\"label\":\"Portugal\"},{\"value\":\"PW\",\"label\":\"Palau\"},{\"value\":\"PY\",\"label\":\"Paraguay\"},{\"value\":\"QA\",\"label\":\"Qatar\"},{\"value\":\"RE\",\"label\":\"Réunion\"},{\"value\":\"RO\",\"label\":\"Romania\"},{\"value\":\"RS\",\"label\":\"Serbia\"},{\"value\":\"RU\",\"label\":\"Russia\"},{\"value\":\"RW\",\"label\":\"Rwanda\"},{\"value\":\"SA\",\"label\":\"Saudi Arabia\"},{\"value\":\"SB\",\"label\":\"Solomon Islands\"},{\"value\":\"SC\",\"label\":\"Seychelles\"},{\"value\":\"SD\",\"label\":\"Sudan\"},{\"value\":\"SE\",\"label\":\"Sweden\"},{\"value\":\"SG\",\"label\":\"Singapore\"},{\"value\":\"SH\",\"label\":\"Saint Helena\"},{\"value\":\"SI\",\"label\":\"Slovenia\"},{\"value\":\"SJ\",\"label\":\"Svalbard and Jan Mayen\"},{\"value\":\"SK\",\"label\":\"Slovakia\"},{\"value\":\"SL\",\"label\":\"Sierra Leone\"},{\"value\":\"SM\",\"label\":\"San Marino\"},{\"value\":\"SN\",\"label\":\"Senegal\"},{\"value\":\"SO\",\"label\":\"Somalia\"},{\"value\":\"SR\",\"label\":\"Suriname\"},{\"value\":\"SS\",\"label\":\"South Sudan\"},{\"value\":\"ST\",\"label\":\"São Tomé and Príncipe\"},{\"value\":\"SV\",\"label\":\"El Salvador\"},{\"value\":\"SY\",\"label\":\"Syria\"},{\"value\":\"SZ\",\"label\":\"Swaziland\"},{\"value\":\"TC\",\"label\":\"Turks and Caicos Islands\"},{\"value\":\"TD\",\"label\":\"Chad\"},{\"value\":\"TF\",\"label\":\"French Southern Territories\"},{\"value\":\"TG\",\"label\":\"Togo\"},{\"value\":\"TH\",\"label\":\"Thailand\"},{\"value\":\"TJ\",\"label\":\"Tajikistan\"},{\"value\":\"TK\",\"label\":\"Tokelau\"},{\"value\":\"TL\",\"label\":\"East Timor\"},{\"value\":\"TM\",\"label\":\"Turkmenistan\"},{\"value\":\"TN\",\"label\":\"Tunisia\"},{\"value\":\"TO\",\"label\":\"Tonga\"},{\"value\":\"TR\",\"label\":\"Turkey\"},{\"value\":\"TT\",\"label\":\"Trinidad and Tobago\"},{\"value\":\"TV\",\"label\":\"Tuvalu\"},{\"value\":\"TW\",\"label\":\"Taiwan\"},{\"value\":\"TZ\",\"label\":\"Tanzania\"},{\"value\":\"UA\",\"label\":\"Ukraine\"},{\"value\":\"UG\",\"label\":\"Uganda\"},{\"value\":\"UM\",\"label\":\"U.S. Minor Outlying Islands\"},{\"value\":\"US\",\"label\":\"United States\"},{\"value\":\"UY\",\"label\":\"Uruguay\"},{\"value\":\"UZ\",\"label\":\"Uzbekistan\"},{\"value\":\"VA\",\"label\":\"Vatican City\"},{\"value\":\"VC\",\"label\":\"Saint Vincent and the Grenadines\"},{\"value\":\"VE\",\"label\":\"Venezuela\"},{\"value\":\"VG\",\"label\":\"British Virgin Islands\"},{\"value\":\"VI\",\"label\":\"U.S. Virgin Islands\"},{\"value\":\"VN\",\"label\":\"Vietnam\"},{\"value\":\"VU\",\"label\":\"Vanuatu\"},{\"value\":\"WF\",\"label\":\"Wallis and Futuna\"},{\"value\":\"WS\",\"label\":\"Samoa\"},{\"value\":\"YE\",\"label\":\"Yemen\"},{\"value\":\"YT\",\"label\":\"Mayotte\"},{\"value\":\"ZA\",\"label\":\"South Africa\"},{\"value\":\"ZM\",\"label\":\"Zambia\"},{\"value\":\"ZW\",\"label\":\"Zimbabwe\"}]"
 	listData := []interface{}{}
-	mapCode:=map[string]string{}
+	mapCode := map[string]string{}
 	err := json.Unmarshal([]byte(regionsList), &listData)
 	if err != nil {
 		fmt.Println("UpdateRegions json err", err)
@@ -237,46 +284,46 @@ func UpdateRegions() {
 		title = strings.TrimSpace(title)
 		code := mapData["value"].(string)
 		code = strings.TrimSpace(code)
-		mapCode[title]=code
-	//}
+		mapCode[title] = code
+		//}
 
-	//playwright.Install(&playwright.RunOptions{Verbose: true, DriverDirectory: "/home/tamnb/.cache/"})
-	//pw, err := playwright.Run()
-	//browser, err := pw.Chromium.Launch()
-	//page, _ := browser.NewPage(playwright.BrowserNewContextOptions{
-	//	UserAgent: &userAgent,
-	//})
-	//fmt.Println("NewPage")
-	//page.Goto("https://ads.tiktok.com/business/creativecenter/music/mobile/en")
-	//time.Sleep(30 * time.Second)
+		//playwright.Install(&playwright.RunOptions{Verbose: true, DriverDirectory: "/home/tamnb/.cache/"})
+		//pw, err := playwright.Run()
+		//browser, err := pw.Chromium.Launch()
+		//page, _ := browser.NewPage(playwright.BrowserNewContextOptions{
+		//	UserAgent: &userAgent,
+		//})
+		//fmt.Println("NewPage")
+		//page.Goto("https://ads.tiktok.com/business/creativecenter/music/mobile/en")
+		//time.Sleep(30 * time.Second)
 
-	//regionElements, err := page.QuerySelectorAll("div[class*=byted-select-popover-panel-search] div[class*=byted-select-popover-panel-inner] div[class*=byted-list-item-inner-wrapper]")
-	//if err != nil {
-	//	log.Fatalf("could not find region Element : %v", err)
-	//}
-	//fmt.Println(len(mapCode),len(regionElements))
-	//for i := 0; i < len(regionElements); i++ {
-	//	title, _ := regionElements[i].TextContent()
-	//	title = strings.TrimSpace(title)
-	//	code,exit:=mapCode[title]
-	//	if !exit {
-	//		fmt.Println("region not found code ", title, code)
-	//		continue
-	//	}
-		data,err:=GetAudioDataFromTiktok(model.TiktokPostAudioRequest{
-			Page: 1,
-			Limit: 20,
+		//regionElements, err := page.QuerySelectorAll("div[class*=byted-select-popover-panel-search] div[class*=byted-select-popover-panel-inner] div[class*=byted-list-item-inner-wrapper]")
+		//if err != nil {
+		//	log.Fatalf("could not find region Element : %v", err)
+		//}
+		//fmt.Println(len(mapCode),len(regionElements))
+		//for i := 0; i < len(regionElements); i++ {
+		//	title, _ := regionElements[i].TextContent()
+		//	title = strings.TrimSpace(title)
+		//	code,exit:=mapCode[title]
+		//	if !exit {
+		//		fmt.Println("region not found code ", title, code)
+		//		continue
+		//	}
+		data, err := GetAudioDataFromTiktokWithRetry(0, model.TiktokPostAudioRequest{
+			Page:   1,
+			Limit:  20,
 			Region: code,
 		})
-		if err!=nil {
-			fmt.Println("error when get data from region ", title, code ,err)
+		if err != nil {
+			fmt.Println("error when get data from region ", title, code, err)
 			continue
 		}
-		if len(data.Data.List)==0 || data.Data.Pagination.TotalCount<10000 {
-			fmt.Println("error: Not found data from region ", title, code , " data = 0",data.Data.Pagination.TotalCount)
+		if len(data.Data.List) == 0 || data.Data.Pagination.TotalCount < 10000 {
+			fmt.Println("error: Not found data from region ", title, code, " data = 0", data.Data.Pagination.TotalCount)
 			continue
 		}
-		fmt.Println("data from region ", title, code , " count " ,data.Data.Pagination.TotalCount)
+		fmt.Println("data from region ", title, code, " count ", data.Data.Pagination.TotalCount)
 		_, err = db.InsertRegionInfo(db.Region{Title: title, Code: code})
 		if err != nil {
 			fmt.Println("UpdateRegions InsertRegionInfo err", err, title, code)

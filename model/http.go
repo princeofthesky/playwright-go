@@ -60,7 +60,7 @@ type TiktokAudioDuration struct {
 	RangeUpper int `json:"range_upper"`
 }
 type TiktokPostAudioRequest struct {
-	//Duration   TiktokAudioDuration `json:"duration"`
+	Duration   TiktokAudioDuration `json:"duration"`
 	Genres     []string            `json:"genres"`
 	Limit      int                 `json:"limit"`
 	Moods      []string            `json:"moods"`
@@ -104,3 +104,22 @@ type TiktokRequestResponse struct {
 	Msg       string             `json:"msg"`
 	RequestId string             `json:"request_id"`
 }
+
+type TiktokVideoInfo struct {
+	Id                 string `json:"Id"`
+	AuthorId           string `json:"author_id"`
+	AuthorName         string `json:"author_name"`
+	AuthorUserName     string `json:"author_user_name"`
+	AudioId            string `json:"audio_id"`
+	AudioAuthor        string `json:"audio_author"`
+	AudioAlbum         string `json:"audio_album"`
+	AudioCover         string `json:"audio_cover"`
+	AudioUrl           string `json:"audio_url"`
+	AudioTitle         string `json:"audio_title"`
+	Description        string `json:"description"`
+	Cover              string `json:"cover"`
+	Url                string `json:"url"`
+	VideoMd5           string `json:"video_md5"`
+}
+
+

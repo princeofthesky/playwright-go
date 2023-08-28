@@ -822,7 +822,7 @@ func (this *TiktokF) doPrivate(e *TiktokT) *TiktokT {
 
 func (this *TiktokT) toByteArray() []int {
 	e := this.T
-	t := make([]int, 127)
+	t := make(map[int]int)
 	t[0] = this.S
 	r := DB - e*DB%8
 	n := 0
@@ -864,7 +864,11 @@ func (this *TiktokT) toByteArray() []int {
 			}
 		}
 	}
-	return t
+	result := make([]int, n)
+	for i := 0; i < n; i++ {
+		result[i] = t[i]
+	}
+	return result
 }
 
 func (this *TiktokT) fromString(e string, i int) {
@@ -967,9 +971,23 @@ func (this *TiktokF) Decrypt(e string) string {
 }
 
 func GetAudioLinkFromDetail(detail string) string {
+	if strings.HasPrefix(detail, "https://") || strings.HasPrefix(detail, "http://") {
+		return detail
+	}
 	if key == nil {
 		Init()
 	}
 	v := V(detail)
-	return key.Decrypt(v)
+	url := key.Decrypt(v)
+	httpsIndex := strings.Index(url, "https://")
+	if httpsIndex > 0 {
+		url = url[httpsIndex:]
+	} else {
+		httpIndex := strings.Index(url, "http://")
+		if httpIndex > 0 {
+			url = url[httpIndex:]
+		}
+	}
+
+	return url
 }

@@ -42,3 +42,50 @@ type RegionTrendingAudio struct {
 	MoodId      int   `json:"mood_id"`
 	Duration    int   `json:"duration"`
 }
+
+type User struct {
+	Id int
+	Name string
+	Avatar string
+	Gender string
+	Birthday string
+	Username string
+	Password string
+	Provider string
+}
+
+type UserAndDevice struct {
+	UserId string
+	DeviceId string
+	LastAccess int64
+}
+
+type MatchResult struct {
+	Id           int     `json:"id"`
+	UserId       int     `json:"user_id"`
+	AudioId      int     `json:"audio_id"`
+	Video        string  `json:"video"`
+	Cover        string  `json:"cover"`
+	VideoMd5     string  `json:"video_md5"`
+	CoverMd5     string  `json:"cover_md5"`
+	Score        int     `json:"score"`
+	Accuracy     float32 `json:"accuracy"`
+	PoseTime     float32 `json:"pose_time"`
+	PlayInfo     string  `json:"play_info"`
+	ReceivedTime int64   `json:"received_time"`
+}
+
+type ListMatch struct {
+	MatchId int
+	UserId int
+	AudioId int
+	Score int
+	Time int
+}
+
+
+type MatchAndYoutube struct {
+	MatchId   int    `json:"match_id"`
+	YoutubeId string `json:"youtube_id"`
+	Thumbnail string `json:"thumbnail"`
+}

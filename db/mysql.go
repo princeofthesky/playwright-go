@@ -31,6 +31,16 @@ func GetAudioById(id int) (Audio, error) {
 	return info, err
 }
 
+func GetAllAudio() ([]Audio, error) {
+	data := []Audio{}
+	err := mysqlDb.Model((*Audio)(nil)).ForEach(
+		func(c *Audio) error {
+			data = append(data, *c)
+			return nil
+		})
+	return data, err
+}
+
 func CountAudios() (int, error) {
 
 	number, err := mysqlDb.Model(&Audio{}).Count()
@@ -139,15 +149,15 @@ func GetGenreByTitle(title string) (Genre, error) {
 	err := mysqlDb.Model(&info).Where("title=?", info.Title).Select()
 	return info, err
 }
-func InsertAudioToListNew(regionId int ,data RegionTrendingAudio) error {
-	_, err := mysqlDb.Exec("INSERT INTO trending_audios_regions_" +strconv.Itoa(regionId)+
+func InsertAudioToListNew(regionId int, data RegionTrendingAudio) error {
+	_, err := mysqlDb.Exec("INSERT INTO trending_audios_regions_"+strconv.Itoa(regionId)+
 		" (audio_id, updated_time, theme_id, genre_id, mood_id, duration) VALUES (?, ?, ?, ?, ?, ?);",
-		data.AudioId,data.UpdatedTime,data.ThemeId,data.GenreId,data.MoodId,data.Duration)
+		data.AudioId, data.UpdatedTime, data.ThemeId, data.GenreId, data.MoodId, data.Duration)
 	return err
 }
 
 func GetListNewAudioId(themes, moods, genres []int, region, minDuration, maxDuration, offset, length int) ([]RegionTrendingAudio, error) {
-	WhereCondition := "updated_time < " + strconv.Itoa(offset) + " AND region_id = " + strconv.Itoa(region) +
+	WhereCondition := "updated_time < " + strconv.Itoa(offset) +
 		" AND duration >= " + strconv.Itoa(minDuration) + " AND duration <= " + strconv.Itoa(maxDuration)
 
 	if len(themes) > 0 {
@@ -177,7 +187,7 @@ func GetListNewAudioId(themes, moods, genres []int, region, minDuration, maxDura
 		WhereCondition = WhereCondition + addedQuery + " ) "
 	}
 	data := []RegionTrendingAudio{}
-	err := mysqlDb.Model((*RegionTrendingAudio)(nil)).Column("audio_id", "updated_time").Where(WhereCondition).Limit(length).Order("updated_time DESC").ForEach(
+	err := mysqlDb.Model().Table("trending_audios_regions_"+strconv.Itoa(region)).Column("audio_id", "updated_time").Where(WhereCondition).Limit(length).Order("updated_time DESC").ForEach(
 		func(c *RegionTrendingAudio) error {
 			data = append(data, *c)
 			return nil
